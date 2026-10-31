@@ -14,7 +14,9 @@ option(CHITRALIPI_FETCH_STB "Download stb_image so the CLI reads/writes PNG, JPE
 option(CHITRALIPI_JNI "Put the Java (JNI) glue inside the shared library" OFF)
 set(CHITRALIPI_STB_DIR "" CACHE PATH "Folder with stb_image.h and stb_image_write.h")
 
-if(ANDROID)
+# Android NDK cross-build (an app's .so). A native Termux build also reports
+# ANDROID, but it has no ANDROID_ABI, so it builds like normal Linux.
+if(ANDROID AND ANDROID_ABI)
   set(CHITRALIPI_JNI ON)
   set(CHITRALIPI_BUILD_CLI OFF)
   set(CHITRALIPI_BUILD_TESTS OFF)
