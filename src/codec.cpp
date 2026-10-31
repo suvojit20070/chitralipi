@@ -2,9 +2,11 @@
 // SPDX-License-Identifier: MIT
 #include "bitio.hpp"
 #include "internal.hpp"
+#include "rangecoder.hpp"
 
 #include <algorithm>
 #include <cstring>
+#include <memory>
 
 namespace chl {
 
@@ -33,6 +35,18 @@ inline int32_t dequantize(int32_t q, uint32_t step) {
     return q < 0 ? int32_t(-c) : int32_t(c);
 }
 
+inline int32_t iabs(int32_t v) { return v < 0 ? -v : v; }
+
+uint32_t plane_base(int role, uint32_t base, uint8_t flags) {
+    if (role == 1) return base == 1 ? 1u : base * 2;
+    if (role == 2 && (flags & F_ALPHA_LOSSLESS)) return 1u;
+    return base;
+}
+
+// ============================================================================
+// Entropy mode 0: zero runs + adaptive Rice (bit stream)
+// ============================================================================
+
 struct Adaptive {
     uint64_t a, n;
     int k;
@@ -49,7 +63,7 @@ struct Adaptive {
     }
 };
 
-void encode_band(BitWriter& bw, const std::vector<int32_t>& q) {
+void rice_encode_band(BitWriter& bw, const std::vector<int32_t>& q) {
     const size_t n = q.size();
     uint64_t sum = 0, count = 0;
     for (int32_t v : q) {
@@ -78,7 +92,7 @@ void encode_band(BitWriter& bw, const std::vector<int32_t>& q) {
     }
 }
 
-void decode_band(BitReader& br, Plane& p, const Band& b, uint32_t step) {
+void rice_decode_band(BitReader& br, Plane& p, const Band& b, uint32_t step) {
     const uint64_t n = uint64_t(b.w) * b.h;
     int k0 = int(br.get(4));
     Adaptive ad(k0);
@@ -98,10 +112,187 @@ void decode_band(BitReader& br, Plane& p, const Band& b, uint32_t step) {
     }
 }
 
-uint32_t plane_base(int role, uint32_t base, uint8_t flags) {
-    if (role == 1) return base == 1 ? 1u : base * 2;
-    if (role == 2 && (flags & F_ALPHA_LOSSLESS)) return 1u;
-    return base;
+// ============================================================================
+// Entropy mode 1: context-adaptive binary arithmetic coding
+// ============================================================================
+
+constexpr int kGroups = 3;    // luma, chroma, alpha
+constexpr int kClasses = 10;  // LL + {HL, LH, HH} x {level 1, 2, 3+}
+constexpr int kNb = 5;        // neighbourhood activity buckets
+constexpr int kPar = 4;       // parent: 0, 1, 2+, none
+
+struct Model {
+    uint16_t sig[kGroups][kClasses][kNb][kPar];
+    uint16_t sgn[kGroups][kClasses][9];
+    uint16_t mag[kGroups][kClasses][kNb][2];
+    uint16_t eg[kGroups][kClasses][32];
+    Model() {
+        uint16_t* p = &sig[0][0][0][0];
+        size_t n = sizeof(Model) / sizeof(uint16_t);
+        for (size_t i = 0; i < n; ++i) p[i] = kProbInit;
+    }
+};
+
+int band_class(const Band& b) {
+    if (b.kind == BAND_LL) return 0;
+    int lv = b.level < 3 ? b.level : 3;
+    return 1 + (int(b.kind) - 1) * 3 + (lv - 1);
+}
+
+int group_of(int role) { return role; }  // 0 luma, 1 chroma, 2 alpha
+
+// Values already coded in this band, addressed relative to the band.
+struct View {
+    const int32_t* v;
+    size_t stride;
+    uint32_t w;
+    int32_t at(uint32_t x, uint32_t y) const { return v[size_t(y) * stride + x]; }
+};
+
+inline int nb_bucket(const View& view, uint32_t x, uint32_t y) {
+    int32_t a = x > 0 ? iabs(view.at(x - 1, y)) : 0;
+    int32_t b = y > 0 ? iabs(view.at(x, y - 1)) : 0;
+    int32_t c = (x > 0 && y > 0) ? iabs(view.at(x - 1, y - 1)) : 0;
+    int32_t d = (y > 0 && x + 1 < view.w) ? iabs(view.at(x + 1, y - 1)) : 0;
+    int64_t s = int64_t(a) + b + (int64_t(c) + d + 1) / 2;
+    return s == 0 ? 0 : s == 1 ? 1 : s == 2 ? 2 : s <= 4 ? 3 : 4;
+}
+
+inline int sign_ctx(const View& view, uint32_t x, uint32_t y) {
+    auto sg = [](int32_t v) { return v > 0 ? 1 : (v < 0 ? 2 : 0); };
+    int l = x > 0 ? sg(view.at(x - 1, y)) : 0;
+    int u = y > 0 ? sg(view.at(x, y - 1)) : 0;
+    return l * 3 + u;
+}
+
+inline int parent_bucket(const int32_t* plane, size_t stride, const Band* pb, uint32_t x, uint32_t y) {
+    if (!pb) return 3;
+    uint32_t px = std::min(x / 2, pb->w - 1), py = std::min(y / 2, pb->h - 1);
+    int32_t v = iabs(plane[size_t(pb->y0 + py) * stride + pb->x0 + px]);
+    return v >= 2 ? 2 : int(v);
+}
+
+inline int32_t med_predict(const View& q, uint32_t x, uint32_t y) {
+    if (x == 0 && y == 0) return 0;
+    if (y == 0) return q.at(x - 1, 0);
+    if (x == 0) return q.at(0, y - 1);
+    int32_t a = q.at(x - 1, y), b = q.at(x, y - 1), c = q.at(x - 1, y - 1);
+    int32_t mx = std::max(a, b), mn = std::min(a, b);
+    if (c >= mx) return mn;
+    if (c <= mn) return mx;
+    return a + b - c;
+}
+
+struct Ctx {
+    int g, cl, nb, par, sc;
+};
+
+void ac_put(RangeEncoder& rc, Model& m, const Ctx& c, int32_t v) {
+    rc.bit(m.sig[c.g][c.cl][c.nb][c.par], v != 0);
+    if (v == 0) return;
+    rc.bit(m.sgn[c.g][c.cl][c.sc], v < 0);
+    uint32_t mag = uint32_t(iabs(v)) - 1;
+    rc.bit(m.mag[c.g][c.cl][c.nb][0], mag >= 1);
+    if (mag < 1) return;
+    rc.bit(m.mag[c.g][c.cl][c.nb][1], mag >= 2);
+    if (mag < 2) return;
+    uint64_t r = uint64_t(mag - 2) + 1;
+    int k = 0;
+    while ((r >> (k + 1)) != 0) ++k;
+    for (int i = 0; i < k; ++i) rc.bit(m.eg[c.g][c.cl][std::min(i, 31)], 1);
+    rc.bit(m.eg[c.g][c.cl][std::min(k, 31)], 0);
+    rc.direct(uint32_t(r - (uint64_t(1) << k)), k);
+}
+
+int32_t ac_get(RangeDecoder& rc, Model& m, const Ctx& c) {
+    if (!rc.bit(m.sig[c.g][c.cl][c.nb][c.par])) return 0;
+    bool neg = rc.bit(m.sgn[c.g][c.cl][c.sc]);
+    uint64_t mag = 0;
+    if (rc.bit(m.mag[c.g][c.cl][c.nb][0])) {
+        mag = 1;
+        if (rc.bit(m.mag[c.g][c.cl][c.nb][1])) {
+            int k = 0;
+            while (rc.bit(m.eg[c.g][c.cl][std::min(k, 31)])) {
+                if (++k > 30) fail(CHL_ERR_FORMAT, "coefficient too large");
+            }
+            uint64_t r = (uint64_t(1) << k) + rc.direct(k);
+            mag = r - 1 + 2;
+        }
+    }
+    if (mag + 1 > uint64_t(INT32_MAX) / 2) fail(CHL_ERR_FORMAT, "coefficient too large");
+    int32_t v = int32_t(mag + 1);
+    return neg ? -v : v;
+}
+
+// Finds the parent band (same kind, one level coarser) for every detail band.
+std::vector<const Band*> parents_of(const std::vector<Band>& bands) {
+    std::vector<const Band*> par(bands.size(), nullptr);
+    for (size_t i = 0; i < bands.size(); ++i) {
+        if (bands[i].kind == BAND_LL) continue;
+        for (const Band& o : bands)
+            if (o.kind == bands[i].kind && o.level == bands[i].level + 1) par[i] = &o;
+    }
+    return par;
+}
+
+// q: quantized plane (row-major, plane width). LL is coded as MED residuals.
+void ac_encode_plane(RangeEncoder& rc, Model& m, int group, const std::vector<int32_t>& q, uint32_t pw,
+                     const std::vector<Band>& bands) {
+    auto par = parents_of(bands);
+    std::vector<int32_t> resid;
+    for (size_t bi = 0; bi < bands.size(); ++bi) {
+        const Band& b = bands[bi];
+        const int cl = band_class(b);
+        View band{q.data() + size_t(b.y0) * pw + b.x0, pw, b.w};
+        if (b.kind == BAND_LL) {
+            resid.assign(size_t(b.w) * b.h, 0);
+            View rv{resid.data(), b.w, b.w};
+            for (uint32_t y = 0; y < b.h; ++y)
+                for (uint32_t x = 0; x < b.w; ++x) {
+                    int32_t r = band.at(x, y) - med_predict(band, x, y);
+                    ac_put(rc, m, Ctx{group, cl, nb_bucket(rv, x, y), 3, sign_ctx(rv, x, y)}, r);
+                    resid[size_t(y) * b.w + x] = r;
+                }
+            continue;
+        }
+        for (uint32_t y = 0; y < b.h; ++y)
+            for (uint32_t x = 0; x < b.w; ++x) {
+                Ctx c{group, cl, nb_bucket(band, x, y), parent_bucket(q.data(), pw, par[bi], x, y),
+                      sign_ctx(band, x, y)};
+                ac_put(rc, m, c, band.at(x, y));
+            }
+    }
+}
+
+void ac_decode_plane(RangeDecoder& rc, Model& m, int group, std::vector<int32_t>& q, uint32_t pw,
+                     const std::vector<Band>& bands) {
+    auto par = parents_of(bands);
+    std::vector<int32_t> resid;
+    for (size_t bi = 0; bi < bands.size(); ++bi) {
+        const Band& b = bands[bi];
+        const int cl = band_class(b);
+        int32_t* base = q.data() + size_t(b.y0) * pw + b.x0;
+        View band{base, pw, b.w};
+        if (b.kind == BAND_LL) {
+            resid.assign(size_t(b.w) * b.h, 0);
+            View rv{resid.data(), b.w, b.w};
+            for (uint32_t y = 0; y < b.h; ++y)
+                for (uint32_t x = 0; x < b.w; ++x) {
+                    int32_t r = ac_get(rc, m, Ctx{group, cl, nb_bucket(rv, x, y), 3, sign_ctx(rv, x, y)});
+                    resid[size_t(y) * b.w + x] = r;
+                    int64_t v = int64_t(r) + med_predict(band, x, y);
+                    if (v > INT32_MAX / 2 || v < -(INT32_MAX / 2)) fail(CHL_ERR_FORMAT, "coefficient too large");
+                    base[size_t(y) * pw + x] = int32_t(v);
+                }
+            continue;
+        }
+        for (uint32_t y = 0; y < b.h; ++y)
+            for (uint32_t x = 0; x < b.w; ++x) {
+                Ctx c{group, cl, nb_bucket(band, x, y), parent_bucket(q.data(), pw, par[bi], x, y),
+                      sign_ctx(band, x, y)};
+                base[size_t(y) * pw + x] = ac_get(rc, m, c);
+            }
+    }
 }
 
 }  // namespace
@@ -111,7 +302,7 @@ int output_channels(uint8_t flags) {
     return gray ? (alpha ? 2 : 1) : (alpha ? 4 : 3);
 }
 
-Prepared prepare(const Image& img, int levels, bool chroma420, bool alpha_lossless) {
+Prepared prepare(const Image& img, int levels, bool chroma420, bool alpha_lossless, int entropy) {
     const size_t count = size_t(img.w) * img.h;
     const int c = img.channels;
     const uint8_t* px = img.px;
@@ -137,7 +328,7 @@ Prepared prepare(const Image& img, int levels, bool chroma420, bool alpha_lossle
     pr.levels = levels;
     pr.flags = uint8_t((alpha ? F_ALPHA : 0) | (gray ? F_GRAY : 0) |
                        (alpha && alpha_lossless ? F_ALPHA_LOSSLESS : 0) |
-                       (!gray && chroma420 ? F_CHROMA420 : 0));
+                       (!gray && chroma420 ? F_CHROMA420 : 0) | (entropy == kEntropyArith ? F_ENTROPY_AC : 0));
 
     if (gray) {
         Plane y(img.w, img.h);
@@ -170,21 +361,42 @@ Prepared prepare(const Image& img, int levels, bool chroma420, bool alpha_lossle
 }
 
 Bytes emit(const Prepared& pr, uint32_t base_step) {
-    BitWriter bw;
-    std::vector<int32_t> q;
-    for (size_t pi = 0; pi < pr.planes.size(); ++pi) {
-        const Plane& p = pr.planes[pi];
-        uint32_t base = plane_base(pr.plane_role[pi], base_step, pr.flags);
-        for (const Band& b : band_layout(p.w, p.h, pr.levels)) {
-            uint32_t step = band_step(base, b, pr.levels);
-            q.resize(size_t(b.w) * b.h);
-            size_t k = 0;
-            for (uint32_t y = 0; y < b.h; ++y)
-                for (uint32_t x = 0; x < b.w; ++x) q[k++] = quantize(p.at(b.x0 + x, b.y0 + y), step);
-            encode_band(bw, q);
+    Bytes data;
+    if (pr.flags & F_ENTROPY_AC) {
+        RangeEncoder rc;
+        auto model = std::make_unique<Model>();
+        std::vector<int32_t> q;
+        for (size_t pi = 0; pi < pr.planes.size(); ++pi) {
+            const Plane& p = pr.planes[pi];
+            uint32_t base = plane_base(pr.plane_role[pi], base_step, pr.flags);
+            auto bands = band_layout(p.w, p.h, pr.levels);
+            q.assign(p.v.size(), 0);
+            for (const Band& b : bands) {
+                uint32_t step = band_step(base, b, pr.levels);
+                for (uint32_t y = b.y0; y < b.y0 + b.h; ++y)
+                    for (uint32_t x = b.x0; x < b.x0 + b.w; ++x)
+                        q[size_t(y) * p.w + x] = quantize(p.at(x, y), step);
+            }
+            ac_encode_plane(rc, *model, group_of(pr.plane_role[pi]), q, p.w, bands);
         }
+        data = rc.finish();
+    } else {
+        BitWriter bw;
+        std::vector<int32_t> q;
+        for (size_t pi = 0; pi < pr.planes.size(); ++pi) {
+            const Plane& p = pr.planes[pi];
+            uint32_t base = plane_base(pr.plane_role[pi], base_step, pr.flags);
+            for (const Band& b : band_layout(p.w, p.h, pr.levels)) {
+                uint32_t step = band_step(base, b, pr.levels);
+                q.resize(size_t(b.w) * b.h);
+                size_t k = 0;
+                for (uint32_t y = 0; y < b.h; ++y)
+                    for (uint32_t x = 0; x < b.w; ++x) q[k++] = quantize(p.at(b.x0 + x, b.y0 + y), step);
+                rice_encode_band(bw, q);
+            }
+        }
+        data = bw.finish();
     }
-    Bytes data = bw.finish();
 
     Bytes out;
     out.reserve(data.size() + 32);
@@ -234,7 +446,7 @@ Header parse_header(const uint8_t* d, size_t len) {
         h.w = uint32_t(w);
         h.h = uint32_t(hh);
         h.flags = d[pos++];
-        if (h.flags & F_NOT_V1) fail(CHL_ERR_UNSUPPORTED, "unknown flags");
+        if (h.flags & F_UNKNOWN) fail(CHL_ERR_UNSUPPORTED, "unknown flags");
         if ((h.flags & F_GRAY) && (h.flags & F_CHROMA420)) fail(CHL_ERR_FORMAT, "gray image with chroma flag");
         if ((h.flags & F_ALPHA_LOSSLESS) && !(h.flags & F_ALPHA)) fail(CHL_ERR_FORMAT, "alpha flag mismatch");
         h.levels = d[pos++];
@@ -280,13 +492,34 @@ Decoded decode_codec(const Header& hd, const uint8_t* d) {
         roles.push_back(2);
     }
 
-    BitReader br(d + hd.data_off, size_t(hd.data_len));
-    for (size_t pi = 0; pi < planes.size(); ++pi) {
-        Plane& p = planes[pi];
-        uint32_t base = plane_base(roles[pi], hd.base_step, flags);
-        for (const Band& b : band_layout(p.w, p.h, hd.levels)) decode_band(br, p, b, band_step(base, b, hd.levels));
+    const uint8_t* data = d + hd.data_off;
+    const size_t data_len = size_t(hd.data_len);
+    if (flags & F_ENTROPY_AC) {
+        if (data_len < 5) fail(CHL_ERR_FORMAT, "bitstream ended early");
+        RangeDecoder rc(data, data_len);
+        auto model = std::make_unique<Model>();
+        for (size_t pi = 0; pi < planes.size(); ++pi) {
+            Plane& p = planes[pi];
+            uint32_t base = plane_base(roles[pi], hd.base_step, flags);
+            auto bands = band_layout(p.w, p.h, hd.levels);
+            ac_decode_plane(rc, *model, group_of(roles[pi]), p.v, p.w, bands);
+            for (const Band& b : bands) {
+                uint32_t step = band_step(base, b, hd.levels);
+                for (uint32_t y = b.y0; y < b.y0 + b.h; ++y)
+                    for (uint32_t x = b.x0; x < b.x0 + b.w; ++x) p.at(x, y) = dequantize(p.at(x, y), step);
+            }
+        }
+        if (!rc.clean_end()) fail(CHL_ERR_FORMAT, "extra data after image");
+    } else {
+        BitReader br(data, data_len);
+        for (size_t pi = 0; pi < planes.size(); ++pi) {
+            Plane& p = planes[pi];
+            uint32_t base = plane_base(roles[pi], hd.base_step, flags);
+            for (const Band& b : band_layout(p.w, p.h, hd.levels))
+                rice_decode_band(br, p, b, band_step(base, b, hd.levels));
+        }
+        if (!br.clean_end()) fail(CHL_ERR_FORMAT, "extra data after image");
     }
-    if (!br.clean_end()) fail(CHL_ERR_FORMAT, "extra data after image");
     for (Plane& p : planes) dwt_inverse(p, hd.levels);
 
     Decoded out;

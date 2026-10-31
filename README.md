@@ -20,14 +20,16 @@ Measured with this code on standard test photos. "JPEG at same size" is the best
 
 | Photo | Setting | Characters | Quality (PSNR) | JPEG at same size |
 | --- | --- | --- | --- | --- |
-| Astronaut 512×512 | quality 80 | 62,869 | 38.5 dB | 38.3 dB |
-| Astronaut 512×512 | quality 40 | 10,159 | 31.3 dB | 29.6 dB |
-| Coffee 600×400 | quality 60 | 30,304 | 35.0 dB | 33.5 dB |
-| Cat 451×300 | quality 40 | 3,561 | 32.2 dB | 29.4 dB |
-| Cat 451×300 | max_chars 4096 | 4,094 | 32.7 dB | |
-| 12 MP photo | max_chars 20,000 | 19,888 | stored at 1222×917 | |
+| Astronaut 512×512 | quality 80 | 52,126 | 38.5 dB | 37.9 dB |
+| Astronaut 512×512 | quality 40 | 8,876 | 31.3 dB | 28.8 dB |
+| Coffee 600×400 | quality 80 | 56,865 | 38.0 dB | 37.0 dB |
+| Cat 451×300 | quality 40 | 3,428 | 32.2 dB | 29.1 dB |
+| Cat 451×300 | max_chars 4096 | 3,956 | 32.8 dB | |
+| 12 MP photo | max_chars 20,000 | 19,843 | stored at 1116×837, 0.8 s | |
 
-A 12 MP photo encodes to 20,000 characters in about 0.5 s on a laptop core. Higher PSNR is better; around 35 dB and above, differences are usually hard to spot.
+Higher PSNR is better; around 35 dB and above, differences are usually hard to spot.
+
+**Screenshots and UI** need more characters than photos, because sharp text is expensive for every codec. A 1080×641 app screenshot: 4,000 characters gives 26.6 dB (text blurry), 10,000 gives 32.5 dB (text readable), 20,000 gives 38.4 dB (close to the original). Here WebP does better at the same size (37.7 dB at 10,000 characters' worth of bytes); improving screenshots is on the roadmap.
 
 **What it cannot do:** no format can store any 10 MB photo as a few KB *and* give back the identical file. Lossless strings are about PNG size. Small strings come from lossy coding, which looks the same to the eye but is not bit-identical. See [SPEC.md](SPEC.md) for the details.
 
@@ -154,7 +156,7 @@ GitHub Actions (`.github/workflows/build.yml`) builds and tests Linux x64/arm64,
 2. Optional 4:2:0 color subsampling
 3. LeGall 5/3 integer wavelet, 5 levels
 4. Quantization (the quality knob)
-5. Zero-run + adaptive Rice entropy coding
+5. Context-adaptive arithmetic coding (a binary range coder with neighbour and parent contexts)
 6. Binary package with header and CRC-32
 7. Lipi-14 text: each 14 bits become one character from U+4E00 to U+8DFF
 

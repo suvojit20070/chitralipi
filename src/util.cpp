@@ -44,8 +44,12 @@ uint64_t get_varint(const uint8_t* d, size_t len, size_t& pos) {
 
 Bytes resize_area(const uint8_t* px, uint32_t w, uint32_t h, int channels, uint32_t nw, uint32_t nh) {
     const size_t c = size_t(channels);
-    // Horizontal pass.
-    std::vector<float> mid(size_t(nw) * h * c, 0.f);
+    // Horizontal pass: weights per output column, then row by row (cache friendly).
+    struct Tap {
+        uint32_t i;
+        float wt;
+    };
+    std::vector<std::vector<Tap>> taps(nw);
     const double sx = double(w) / nw;
     for (uint32_t x = 0; x < nw; ++x) {
         double a = x * sx, b = (x + 1) * sx;
@@ -54,11 +58,16 @@ Bytes resize_area(const uint8_t* px, uint32_t w, uint32_t h, int channels, uint3
         for (uint32_t i = i0; i <= i1; ++i) {
             double lo = i > a ? i : a, hi = (i + 1) < b ? (i + 1) : b;
             float wt = float((hi - lo) / sx);
-            if (wt <= 0) continue;
-            for (uint32_t y = 0; y < h; ++y)
-                for (size_t k = 0; k < c; ++k)
-                    mid[(size_t(y) * nw + x) * c + k] += wt * px[(size_t(y) * w + i) * c + k];
+            if (wt > 0) taps[x].push_back(Tap{i, wt});
         }
+    }
+    std::vector<float> mid(size_t(nw) * h * c, 0.f);
+    for (uint32_t y = 0; y < h; ++y) {
+        const uint8_t* row = px + size_t(y) * w * c;
+        float* out = &mid[size_t(y) * nw * c];
+        for (uint32_t x = 0; x < nw; ++x)
+            for (const Tap& t : taps[x])
+                for (size_t k = 0; k < c; ++k) out[x * c + k] += t.wt * row[size_t(t.i) * c + k];
     }
     // Vertical pass.
     std::vector<float> acc(size_t(nw) * nh * c, 0.f);
@@ -78,6 +87,31 @@ Bytes resize_area(const uint8_t* px, uint32_t w, uint32_t h, int channels, uint3
     for (size_t i = 0; i < acc.size(); ++i) {
         float v = acc[i] + 0.5f;
         out[i] = uint8_t(v < 0 ? 0 : (v > 255 ? 255 : v));
+    }
+    return out;
+}
+
+Bytes resize_bilinear(const uint8_t* px, uint32_t w, uint32_t h, int channels, uint32_t nw, uint32_t nh) {
+    const size_t c = size_t(channels);
+    Bytes out(size_t(nw) * nh * c);
+    const double sx = double(w) / nw, sy = double(h) / nh;
+    for (uint32_t y = 0; y < nh; ++y) {
+        double fy = (y + 0.5) * sy - 0.5;
+        if (fy < 0) fy = 0;
+        uint32_t y0 = uint32_t(fy), y1 = y0 + 1 < h ? y0 + 1 : h - 1;
+        double ty = fy - y0;
+        for (uint32_t x = 0; x < nw; ++x) {
+            double fx = (x + 0.5) * sx - 0.5;
+            if (fx < 0) fx = 0;
+            uint32_t x0 = uint32_t(fx), x1 = x0 + 1 < w ? x0 + 1 : w - 1;
+            double tx = fx - x0;
+            for (size_t k = 0; k < c; ++k) {
+                double a = px[(size_t(y0) * w + x0) * c + k], b = px[(size_t(y0) * w + x1) * c + k];
+                double d = px[(size_t(y1) * w + x0) * c + k], e = px[(size_t(y1) * w + x1) * c + k];
+                double v = (a * (1 - tx) + b * tx) * (1 - ty) + (d * (1 - tx) + e * tx) * ty + 0.5;
+                out[(size_t(y) * nw + x) * c + k] = uint8_t(v < 0 ? 0 : (v > 255 ? 255 : v));
+            }
+        }
     }
     return out;
 }

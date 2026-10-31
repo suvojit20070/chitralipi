@@ -1,6 +1,6 @@
 # Chitralipi Format, Version 1
 
-Status: stable for v1. A decoder that follows this document must produce exactly the same pixels as the reference implementation.
+Status: stable for v1 (format version 1; library 1.1 adds entropy mode 1, library 1.0 reads only mode 0). A decoder that follows this document must produce exactly the same pixels as the reference implementation.
 
 Notation: `>>` is arithmetic right shift (floor division by a power of two, also for negative numbers). All values are integers. Bytes and bits are big-endian / most significant bit first unless a field says otherwise.
 
@@ -55,7 +55,7 @@ Flags:
 | 1 | chroma 4:2:0 (never with bit 2) |
 | 2 | grayscale (luma plane only) |
 | 3 | alpha lossless (requires bit 0) |
-| 4-5 | entropy mode, must be 0 in v1 |
+| 4-5 | entropy mode: 0 = run + Rice (section 7), 1 = arithmetic coding (section 8); 2-3 not defined |
 | 6-7 | reserved, must be 0 |
 
 ### Mode 0: packed file
@@ -130,7 +130,7 @@ dequantize: c = 0 if q = 0, else sign(q) × (((2|q| + 1) × step) >> 1)
 
 With BaseStep = 1 every step is 1 and the image is pixel-lossless.
 
-## 7. Entropy coding
+## 7. Entropy mode 0: run + Rice
 
 Data is one bit stream, most significant bit first, zero-padded to a byte. Order: planes as in section 4; inside a plane LL first, then for l = L down to 1: HL, LH, HH; inside a band row by row, left to right.
 
@@ -154,11 +154,84 @@ The encoder maps `q` to `u = 2q` (q ≥ 0) or `-2q - 1` (q < 0) and writes `m = 
 
 After the last band the reader must have used every Data byte and every padding bit must be zero.
 
-## 8. Decoder safety rules
+## 8. Entropy mode 1: context-adaptive arithmetic coding
+
+Encoders from library 1.1 write this mode. Same plane and band order as section 7. Each plane is first decoded completely as quantized values `q`, then dequantized band by band.
+
+### 8.1 Range decoder
+
+A binary range coder with 11-bit probabilities (the LZMA design):
+
+```text
+init:   range = 0xFFFFFFFF; code = first 5 bytes, big-endian (the first byte is always 0, so code fits 32 bits)
+bit(p): bound = (range >> 11) * p
+        if code < bound: range = bound;  p += (2048 - p) >> 5;  result 0
+        else:            code -= bound;  range -= bound;  p -= p >> 5;  result 1
+        while range < 2^24: range <<= 8;  code = (code << 8) | next byte
+direct(n): n times { range >>= 1; b = code >= range; if b: code -= range;
+                     normalise as above; v = (v << 1) | b }   (most significant bit first)
+```
+
+Every probability `p` starts at 1024. Reading past DataLen is an error, and after the last plane the decoder must have read exactly DataLen bytes.
+
+### 8.2 Contexts
+
+Probabilities are indexed by group `g` (0 luma, 1 chroma, 2 alpha) and class `cl` (0 = LL; detail bands `1 + 3 × (kind − 1) + (min(level, 3) − 1)` with kind HL = 1, LH = 2, HH = 3). Within one group the probabilities carry on from plane to plane and band to band.
+
+| Name | Index | Count per (g, cl) |
+| --- | --- | --- |
+| sig | nb × par | 5 × 4 |
+| sgn | sc | 9 |
+| mag | nb × 2 | 5 × 2 |
+| eg | k (0..31) | 32 |
+
+For a value at band position (x, y), using values already decoded in the same band (outside the band = 0):
+
+```text
+a = |left|, b = |up|, c = |up-left|, d = |up-right|
+s = a + b + floor((c + d + 1) / 2)
+nb = 0 if s = 0, 1 if s = 1, 2 if s = 2, 3 if s <= 4, else 4
+sc = 3 × sgn(left) + sgn(up)        where sgn gives 0 for zero, 1 for positive, 2 for negative
+par = 3 for LL, level-L bands, and bands whose coarser band is empty; otherwise with P = the band of the same kind one level coarser,
+      v = |P(min(x/2, P.w − 1), min(y/2, P.h − 1))|, par = min(v, 2)
+```
+
+### 8.3 One value
+
+```text
+if bit(sig[nb][par]) = 0: value = 0, done
+negative = bit(sgn[sc])
+m = 0
+if bit(mag[nb][0]) = 1:
+    m = 1
+    if bit(mag[nb][1]) = 1:
+        k = 0; while bit(eg[min(k, 31)]) = 1: k += 1   (k above 30 is an error)
+        m = 2^k + direct(k) + 1
+value = ±(m + 1)
+```
+
+### 8.4 LL band
+
+The LL band stores residuals. In raster order, with `q` the LL values decoded so far:
+
+```text
+pred = 0 at (0,0); q(x−1, 0) on the first row; q(0, y−1) in the first column; otherwise MED:
+    a = q(x−1, y), b = q(x, y−1), c = q(x−1, y−1)
+    pred = min(a, b) if c >= max(a, b);  max(a, b) if c <= min(a, b);  else a + b − c
+q(x, y) = pred + residual
+```
+
+The residual is coded as in 8.3 with `cl = 0`, `par = 3`, and `nb`, `sc` computed from the neighbouring *residuals*.
+
+## 9. Encoder freedom
+
+Anything that only affects the encoder may change between versions without breaking decoders: how quality maps to BaseStep, rounding in quantization, chroma downsampling filter, the choice of `k0`, and how `max_chars` picks a size. The reference encoder for `max_chars` tries several image sizes, decodes each candidate, scales it back and keeps the one with the smallest error.
+
+## 10. Decoder safety rules
 
 Reject: unknown version, mode, flags or kind; Width × Height above 2^26; Levels above 15; BaseStep outside 1..2^20; DataLen past the end; CRC mismatch; bytes after the package (except the one Lipi-14 zero byte); runs past the end of a band; a bit stream that ends early or has leftover data.
 
-## 9. Worked example
+## 11. Worked example
 
 2×2 RGB image, Levels 1, BaseStep 1: red (255,0,0), green (0,255,0) in row 0; blue (0,0,255), white (255,255,255) in row 1.
 

@@ -147,6 +147,29 @@ void test_lossless_roundtrip() {
             }
 }
 
+// Strings made by v1.0 (entropy mode 0, run + Rice) must still decode.
+void test_both_entropy_modes() {
+    for (int entropy : {chl::kEntropyRice, chl::kEntropyArith}) {
+        for (int c : {1, 3, 4}) {
+            Img im = make_image(77, 41, c, unsigned(9 + c), true);
+            for (uint32_t step : {1u, 7u, 60u}) {
+                auto prep = chl::prepare(chl::Image{im.px.data(), im.w, im.h, c}, 5, step > 1, true, entropy);
+                chl::Bytes pkg = chl::emit(prep, step);
+                CHECK(bool(pkg[5] & chl::F_ENTROPY_AC) == (entropy == chl::kEntropyArith));
+                std::string s = chl::text_encode(pkg.data(), pkg.size(), CHL_TEXT_UNICODE);
+                Img out{};
+                CHECK(decode(s, out));
+                if (step == 1 && c == 3) CHECK(out.px == im.px);
+            }
+        }
+    }
+    // The arithmetic coder must be smaller than Rice on a real-looking image.
+    Img im = make_image(256, 256, 3, 77, true);
+    auto rice = chl::emit(chl::prepare(chl::Image{im.px.data(), 256, 256, 3}, 5, true, true, chl::kEntropyRice), 12);
+    auto arith = chl::emit(chl::prepare(chl::Image{im.px.data(), 256, 256, 3}, 5, true, true, chl::kEntropyArith), 12);
+    CHECK(arith.size() < rice.size());
+}
+
 void test_lossy_quality() {
     Img im = make_image(320, 200, 3, 3, false);
     double last = 1e9;
@@ -319,6 +342,7 @@ int main() {
     test_spec_example();
     test_wavelet_random();
     test_lossless_roundtrip();
+    test_both_entropy_modes();
     test_lossy_quality();
     test_max_chars();
     test_corruption();

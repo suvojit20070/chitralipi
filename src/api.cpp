@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: MIT
 #include "internal.hpp"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
@@ -21,8 +22,10 @@ const uint16_t kQualityStep[101] = {
     3,   3,   3,   2,   2,   2,   2,   2,   2,   2,   2,   2,   2,   2,   2,   2,   2,   2,   2,   1};
 
 constexpr uint32_t kSearchMaxStep = 4096;
-constexpr uint32_t kResizeStepCap = 40;  // above this a smaller image usually looks better
-constexpr double kMinBitsPerPixel = 0.25;
+constexpr double kScaleFactor = 0.8;     // each smaller candidate is 80% of the previous size
+constexpr double kRefPixels = 1.0e6;     // quality is judged on a copy of at most 1 megapixel
+constexpr double kStartBpp = 0.3;        // first size tried gets about this many bits per pixel
+constexpr uint32_t kFirstGuessStep = 24; // first step tried when there is no hint
 
 template <class F>
 int32_t guard(F&& f) {
@@ -76,61 +79,212 @@ void validate(const uint8_t* px, uint32_t w, uint32_t h, int32_t ch, const chl_o
     if (o.chroma_420 < -1 || o.chroma_420 > 1 || o.reserved != 0) fail(CHL_ERR_ARGUMENT, "bad option");
 }
 
+// Largest package (bytes) whose text fits in `limit` characters.
+uint64_t max_package_bytes(uint64_t limit, chl_text_mode mode) {
+    uint64_t prefix = mode == CHL_TEXT_ASCII ? 6 : 5, bits = mode == CHL_TEXT_ASCII ? 6 : 14;
+    if (limit <= prefix) return 0;
+    uint64_t n = (limit - prefix) * bits / 8;
+    while (n > 0 && text_chars(n, mode) > limit) --n;
+    return n;
+}
+
+// Finds (within ~3%) the smallest step whose package is at most max_bytes. Package size falls
+// roughly as a power of the step, so the search runs regula falsi (Illinois) on log(size) vs
+// log(step) and needs only a few encodes. `hint` is a good first guess (0 = none). Empty result
+// means nothing fits; then *coarsest_size is the size at the coarsest step.
+Bytes fit_step(const Prepared& prep, uint32_t step_min, uint32_t hint, uint64_t max_bytes, size_t* coarsest_size) {
+    const uint32_t step_max = step_min > kSearchMaxStep ? step_min : kSearchMaxStep;
+    const double target = std::log(double(max_bytes > 0 ? max_bytes : 1));
+    uint32_t bad = 0, good = 0;  // bad: too big, good: fits
+    double f_bad = 0, f_good = 0;
+    int last_side = 0;
+    Bytes good_bytes;
+    auto probe = [&](uint32_t st) {
+        Bytes t = emit(prep, st);
+        double f = std::log(double(t.size())) - target;
+        if (st == step_max && coarsest_size) *coarsest_size = t.size();
+        if (t.size() <= max_bytes) {
+            good = st;
+            f_good = f;
+            good_bytes = std::move(t);
+            if (last_side == 1) f_bad /= 2;
+            last_side = 1;
+            return true;
+        }
+        bad = st;
+        f_bad = f;
+        if (last_side == -1) f_good /= 2;
+        last_side = -1;
+        return false;
+    };
+
+    // 1. Bracket the answer, starting from the hint.
+    uint32_t s = hint ? hint : std::max<uint32_t>(step_min, kFirstGuessStep);
+    s = std::min(std::max(s, step_min), step_max);
+    if (probe(s)) {
+        while (good > step_min) {
+            uint32_t down = std::max(step_min, good / 4);
+            if (!probe(down)) break;
+        }
+        if (good == step_min) return good_bytes;  // the requested quality already fits
+    } else {
+        while (bad < step_max) {
+            uint32_t up = std::min<uint64_t>(step_max, uint64_t(bad) * 4);
+            if (probe(up)) break;
+        }
+        if (!good) return Bytes();
+    }
+    last_side = 0;
+
+    // 2. Narrow it down.
+    for (int i = 0; i < 20 && good > bad + 1 && double(good) > double(bad) * 1.03; ++i) {
+        double xb = std::log(double(bad)), xg = std::log(double(good));
+        double guess = std::sqrt(double(bad) * double(good));
+        if (f_bad > 0 && f_good <= 0 && f_bad - f_good > 1e-12)
+            guess = std::exp((xb * f_good - xg * f_bad) / (f_good - f_bad));
+        uint32_t st = uint32_t(guess + 0.5);
+        if (st <= bad) st = bad + 1;
+        if (st >= good) st = good - 1;
+        probe(st);
+    }
+    return good_bytes;
+}
+
+// Pixels as RGBA, so images with different channel counts can be compared.
+Bytes to_rgba(const uint8_t* px, size_t n, int ch) {
+    Bytes out(n * 4);
+    const size_t c = size_t(ch);
+    for (size_t i = 0; i < n; ++i) {
+        const uint8_t* a = px + i * c;
+        uint8_t* o = &out[i * 4];
+        o[0] = a[0];
+        o[1] = c >= 3 ? a[1] : a[0];
+        o[2] = c >= 3 ? a[2] : a[0];
+        o[3] = (c == 2 || c == 4) ? a[c - 1] : 255;
+    }
+    return out;
+}
+
+// The original, at most kRefPixels big, that every candidate is compared against.
+struct Reference {
+    Bytes rgba;
+    uint32_t w, h;
+};
+
+Reference make_reference(const uint8_t* px, uint32_t w, uint32_t h, int ch) {
+    Reference r{Bytes(), w, h};
+    double area = double(w) * h;
+    if (area > kRefPixels) {
+        double s = std::sqrt(kRefPixels / area);
+        r.w = std::max<uint32_t>(1, uint32_t(w * s));
+        r.h = std::max<uint32_t>(1, uint32_t(h * s));
+        Bytes small = resize_area(px, w, h, ch, r.w, r.h);
+        r.rgba = to_rgba(small.data(), size_t(r.w) * r.h, ch);
+    } else {
+        r.rgba = to_rgba(px, size_t(w) * h, ch);
+    }
+    return r;
+}
+
+// Error of a candidate as the viewer sees it: decoded and scaled to the reference size.
+double candidate_error(const Bytes& pkg, const Reference& ref) {
+    Header hd = parse_header(pkg.data(), pkg.size());
+    Decoded d = decode_codec(hd, pkg.data());
+    Bytes rgba = to_rgba(d.px.data(), size_t(d.w) * d.h, d.channels);
+    if (d.w != ref.w || d.h != ref.h) {
+        bool shrink = uint64_t(d.w) * d.h > uint64_t(ref.w) * ref.h;
+        rgba = shrink ? resize_area(rgba.data(), d.w, d.h, 4, ref.w, ref.h)
+                      : resize_bilinear(rgba.data(), d.w, d.h, 4, ref.w, ref.h);
+    }
+    double se = 0;
+    for (size_t i = 0; i < rgba.size(); ++i) {
+        double e = double(rgba[i]) - ref.rgba[i];
+        se += e * e;
+    }
+    return se;
+}
+
+// Tries the full size and smaller sizes, keeps the one that looks best at the original size.
 Bytes encode_fit(const uint8_t* px, uint32_t w, uint32_t h, int ch, const chl_options& o) {
     const chl_text_mode mode = chl_text_mode(o.text_mode);
     const uint64_t limit = o.max_chars;
     const uint32_t step_min = step_for(o);
     const bool chroma = o.chroma_420 < 0 ? true : o.chroma_420 != 0;
-    auto fits = [&](const Bytes& b) { return text_chars(b.size(), mode) <= limit; };
+    const double budget_bits = double(limit) * (mode == CHL_TEXT_ASCII ? 6.0 : 14.0);
+    const uint64_t max_bytes = max_package_bytes(limit, mode);
+    const Reference ref = make_reference(px, w, h, ch);
 
-    double scale = 1.0;
-    if (o.allow_resize) {
-        double bits = double(limit) * (mode == CHL_TEXT_ASCII ? 6.0 : 14.0);
-        double bpp = bits / (double(w) * h);
-        if (bpp < kMinBitsPerPixel) scale = std::sqrt(bpp / kMinBitsPerPixel);
-    }
-
-    Bytes fallback;
-    for (int round = 0; round < 64; ++round) {
+    struct Candidate {
+        bool fits = false;
+        double err = 0;
+        uint32_t step = 0;
+        size_t coarsest = 0;
+        Bytes pkg;
+    };
+    uint32_t hint = 0;
+    auto try_scale = [&](double scale) {
+        Candidate c;
         uint32_t sw = uint32_t(std::lround(w * scale)), sh = uint32_t(std::lround(h * scale));
-        if (sw < 1) sw = 1;
-        if (sh < 1) sh = 1;
-        if (sw > w) sw = w;
-        if (sh > h) sh = h;
+        sw = sw < 1 ? 1 : (sw > w ? w : sw);
+        sh = sh < 1 ? 1 : (sh > h ? h : sh);
         Bytes resized;
         const uint8_t* src = px;
         if (sw != w || sh != h) {
             resized = resize_area(px, w, h, ch, sw, sh);
             src = resized.data();
         }
-        Prepared prep = prepare(Image{src, sw, sh, ch}, o.levels, chroma, o.alpha_lossless != 0);
-
-        uint32_t hi = step_min > kSearchMaxStep ? step_min : kSearchMaxStep;
-        Bytes best = emit(prep, hi);
-        bool ok = fits(best);
-        uint32_t found = hi;
-        if (ok) {
-            uint32_t lo = step_min;
-            while (lo < hi) {
-                uint32_t mid = lo + (hi - lo) / 2;
-                Bytes b = emit(prep, mid);
-                if (fits(b)) {
-                    hi = mid;
-                    best = std::move(b);
-                } else {
-                    lo = mid + 1;
-                }
-            }
-            found = hi;
+        c.pkg = fit_step(prepare(Image{src, sw, sh, ch}, o.levels, chroma, o.alpha_lossless != 0), step_min, hint,
+                         max_bytes, &c.coarsest);
+        if (!c.pkg.empty()) {
+            c.fits = true;
+            c.step = parse_header(c.pkg.data(), c.pkg.size()).base_step;
+            c.err = candidate_error(c.pkg, ref);
+            hint = c.step;
         }
-        if (ok && (!o.allow_resize || found <= kResizeStepCap)) return best;
-        if (ok && fallback.empty()) fallback = std::move(best);
-        if (!o.allow_resize) fail(CHL_ERR_TOO_BIG, "does not fit in max_chars");
-        if (sw <= 8 && sh <= 8) break;
-        scale *= 0.8;
+        return c;
+    };
+    auto too_small = [&](double scale) { return w * scale < 8 && h * scale < 8; };
+
+    // Start where the budget gives about kStartBpp bits per pixel.
+    double scale = 1.0;
+    if (o.allow_resize) {
+        double bpp = budget_bits / (double(w) * h);
+        if (bpp < kStartBpp) scale = std::sqrt(bpp / kStartBpp);
     }
-    if (!fallback.empty()) return fallback;
-    fail(CHL_ERR_TOO_BIG, "does not fit in max_chars");
+    Candidate best = try_scale(scale);
+    if (!o.allow_resize) {
+        if (!best.fits) fail(CHL_ERR_TOO_BIG, "does not fit in max_chars");
+        return std::move(best.pkg);
+    }
+    // Shrink until something fits.
+    while (!best.fits && !too_small(scale)) {
+        double jump = best.coarsest ? std::sqrt(budget_bits / 8.0 / double(best.coarsest)) * 0.95 : kScaleFactor;
+        scale *= std::max(0.05, std::min(kScaleFactor, jump));
+        best = try_scale(scale);
+    }
+    if (!best.fits) fail(CHL_ERR_TOO_BIG, "does not fit in max_chars");
+    double best_scale = scale;
+
+    // Walk down while it looks better; if the first step down is worse, walk up instead.
+    bool moved_down = false;
+    for (double s2 = best_scale * kScaleFactor; best.err > 0 && !too_small(s2); s2 *= kScaleFactor) {
+        Candidate c = try_scale(s2);
+        if (!c.fits || c.err >= best.err) break;
+        best = std::move(c);
+        best_scale = s2;
+        moved_down = true;
+    }
+    if (!moved_down) {
+        hint = best.step;
+        for (double s2 = best_scale / kScaleFactor; best.err > 0 && best_scale < 1.0; s2 /= kScaleFactor) {
+            if (s2 > 1.0) s2 = 1.0;
+            Candidate c = try_scale(s2);
+            if (!c.fits || c.err >= best.err) break;
+            best = std::move(c);
+            best_scale = s2;
+        }
+    }
+    return std::move(best.pkg);
 }
 
 Bytes encode_any(const uint8_t* px, uint32_t w, uint32_t h, int32_t ch, const chl_options* in) {
@@ -155,7 +309,7 @@ void give_pixels(const Decoded& d, uint8_t** px, uint32_t* w, uint32_t* h, int32
 
 extern "C" {
 
-CHL_API const char* chl_version(void) { return "1.0.0"; }
+CHL_API const char* chl_version(void) { return "1.1.0"; }
 
 CHL_API const char* chl_status_string(int32_t s) {
     switch (s) {

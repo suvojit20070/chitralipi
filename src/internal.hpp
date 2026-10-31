@@ -41,14 +41,19 @@ enum : uint8_t {
     F_CHROMA420 = 2,
     F_GRAY = 4,
     F_ALPHA_LOSSLESS = 8,
-    F_NOT_V1 = 0xF0,  // entropy mode (bits 4-5) must be 0, bits 6-7 reserved
+    F_ENTROPY_AC = 0x10,  // bits 4-5 = entropy mode: 0 run+Rice, 1 arithmetic coding
+    F_UNKNOWN = 0xE0,     // entropy modes 2-3 and bits 6-7 are not defined
 };
+
+constexpr int kEntropyRice = 0;
+constexpr int kEntropyArith = 1;
 
 // ---- helpers (util.cpp) -----------------------------------------------------
 uint32_t crc32(const uint8_t* data, size_t len);
 void put_varint(Bytes& out, uint64_t value);
 uint64_t get_varint(const uint8_t* data, size_t len, size_t& pos);
 Bytes resize_area(const uint8_t* px, uint32_t w, uint32_t h, int channels, uint32_t nw, uint32_t nh);
+Bytes resize_bilinear(const uint8_t* px, uint32_t w, uint32_t h, int channels, uint32_t nw, uint32_t nh);
 uint32_t detect_file_kind(const uint8_t* data, size_t len);
 
 // ---- planes and transforms (transform.cpp) ----------------------------------
@@ -106,7 +111,7 @@ struct Prepared {
     std::vector<int> plane_role; // 0 luma, 1 chroma, 2 alpha
 };
 
-Prepared prepare(const Image& img, int levels, bool chroma420, bool alpha_lossless);
+Prepared prepare(const Image& img, int levels, bool chroma420, bool alpha_lossless, int entropy = kEntropyArith);
 Bytes emit(const Prepared& prep, uint32_t base_step);
 
 struct Header {
