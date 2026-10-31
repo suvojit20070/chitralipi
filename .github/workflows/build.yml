@@ -32,6 +32,13 @@ jobs:
         run: ctest --test-dir build -C Release --output-on-failure
       - name: Install
         run: cmake --install build --config Release --prefix dist
+      - name: Developer usage test (pkg-config + find_package)
+        if: runner.os == 'Linux'
+        run: |
+          export PKG_CONFIG_PATH=$PWD/dist/lib/pkgconfig LD_LIBRARY_PATH=$PWD/dist/lib
+          cc examples/c/hello.c -o hello $(pkg-config --cflags --libs chitralipi) && ./hello
+          cmake -S examples/cmake -B build-example -DCMAKE_PREFIX_PATH=$PWD/dist && cmake --build build-example
+          ./build-example/hello
       - uses: actions/setup-python@v5
         with: { python-version: '3.12' }
       - name: Python binding test
@@ -61,6 +68,29 @@ jobs:
         with:
           name: chitralipi-${{ matrix.name }}
           path: chitralipi-${{ matrix.name }}.zip
+
+  termux:
+    # Real Termux userland in Docker: same steps a developer runs on the phone.
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build, test and use inside Termux
+        run: |
+          docker run --rm -v "$PWD:/src:ro" termux/termux-docker:x86_64 bash -c '
+            set -e
+            pkg install -y clang cmake git make pkg-config python
+            cp -r /src $HOME/chitralipi && cd $HOME/chitralipi
+            cmake -B build -DCMAKE_INSTALL_PREFIX=$PREFIX -DCHITRALIPI_FETCH_STB=ON
+            cmake --build build -j4
+            ctest --test-dir build --output-on-failure
+            cmake --install build
+            chitralipi --help
+            clang examples/c/hello.c -o hello $(pkg-config --cflags --libs chitralipi)
+            ./hello
+            cp bindings/python/chitralipi.py "$(python -c "import sysconfig;print(sysconfig.get_paths()[\"purelib\"])")/"
+            python tests/test_python.py
+          '
 
   java:
     runs-on: ubuntu-latest

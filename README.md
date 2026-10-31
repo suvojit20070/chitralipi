@@ -31,6 +31,18 @@ A 12 MP photo encodes to 20,000 characters in about 0.5 s on a laptop core. High
 
 **What it cannot do:** no format can store any 10 MB photo as a few KB *and* give back the identical file. Lossless strings are about PNG size. Small strings come from lossy coding, which looks the same to the eye but is not bit-identical. See [SPEC.md](SPEC.md) for the details.
 
+## Install
+
+**Termux (Android) or Linux**, one command (builds from source, runs the tests, installs the CLI, library, header, pkg-config file, CMake package and Python module):
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/suvojit20070/chitralipi/main/scripts/install.sh | bash
+```
+
+Full developer guide for Termux: [docs/TERMUX.md](docs/TERMUX.md).
+
+**Prebuilt files** for Windows, macOS, Linux, Android (`.aar`), Java (`.jar`) and WebAssembly are on the [Releases page](https://github.com/suvojit20070/chitralipi/releases).
+
 ## Quick start
 
 ### Command line
@@ -98,6 +110,17 @@ const chl = await loadChitralipi();
 const text = chl.encode(imageData.data, imageData.width, imageData.height, 4, { maxChars: 4000 });
 const img = chl.decode(text);
 ctx.putImageData(new ImageData(chl.toRGBA(img), img.width, img.height), 0, 0);
+```
+
+### Using the installed library
+
+```sh
+clang app.c -o app $(pkg-config --cflags --libs chitralipi)       # C, with pkg-config
+```
+
+```cmake
+find_package(chitralipi 1 REQUIRED)                               # CMake projects
+target_link_libraries(myapp PRIVATE chitralipi::chitralipi)
 ```
 
 ### Other languages

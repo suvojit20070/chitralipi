@@ -66,6 +66,21 @@ def _load():
                 return ctypes.CDLL(path)
             except OSError:
                 continue
+    # Installed system-wide (for example Termux $PREFIX/lib or /usr/local/lib).
+    prefix_dirs = [os.path.join(os.environ.get("PREFIX", ""), "lib"), os.path.join(sys.prefix, "lib"),
+                   "/usr/local/lib", "/usr/lib"]
+    for name in names:
+        for d in prefix_dirs:
+            path = os.path.join(d, name)
+            if os.path.exists(path):
+                try:
+                    return ctypes.CDLL(path)
+                except OSError:
+                    pass
+        try:
+            return ctypes.CDLL(name)
+        except OSError:
+            pass
     raise OSError("Chitralipi library not found. Put it next to chitralipi.py or set CHITRALIPI_LIB.")
 
 

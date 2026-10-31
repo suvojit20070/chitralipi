@@ -77,11 +77,30 @@ target_include_directories(chitralipi_static PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include> $<INSTALL_INTERFACE:include>)
 
 include(GNUInstallDirs)
-install(TARGETS chitralipi chitralipi_static
+install(TARGETS chitralipi chitralipi_static EXPORT chitralipiTargets
   RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
   LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
   ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR})
 install(FILES include/chitralipi/chitralipi.h DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/chitralipi)
+
+# find_package(chitralipi) -> chitralipi::chitralipi (shared) and chitralipi::chitralipi_static
+install(EXPORT chitralipiTargets
+  NAMESPACE chitralipi::
+  FILE chitralipiConfig.cmake
+  DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/chitralipi)
+include(CMakePackageConfigHelpers)
+write_basic_package_version_file(${CMAKE_CURRENT_BINARY_DIR}/chitralipiConfigVersion.cmake
+  VERSION ${PROJECT_VERSION} COMPATIBILITY SameMajorVersion)
+install(FILES ${CMAKE_CURRENT_BINARY_DIR}/chitralipiConfigVersion.cmake
+  DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/chitralipi)
+
+# pkg-config: clang app.c $(pkg-config --cflags --libs chitralipi)
+file(RELATIVE_PATH CHL_PC_TO_PREFIX "/r/${CMAKE_INSTALL_LIBDIR}/pkgconfig" "/r")  # relocatable
+configure_file(cmake/chitralipi.pc.in ${CMAKE_CURRENT_BINARY_DIR}/chitralipi.pc @ONLY)
+install(FILES ${CMAKE_CURRENT_BINARY_DIR}/chitralipi.pc DESTINATION ${CMAKE_INSTALL_LIBDIR}/pkgconfig)
+
+# Python module next to the other files, so installers can copy it.
+install(FILES bindings/python/chitralipi.py DESTINATION ${CMAKE_INSTALL_DATADIR}/chitralipi/python)
 
 # ---- command line tool --------------------------------------------------------
 if(CHITRALIPI_BUILD_CLI)

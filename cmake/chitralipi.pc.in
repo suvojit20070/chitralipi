@@ -1,0 +1,10 @@
+prefix=${pcfiledir}/@CHL_PC_TO_PREFIX@
+libdir=${prefix}/@CMAKE_INSTALL_LIBDIR@
+includedir=${prefix}/@CMAKE_INSTALL_INCLUDEDIR@
+
+Name: chitralipi
+Description: Image to text string and back (own wavelet codec, no server)
+URL: https://github.com/suvojit20070/chitralipi
+Version: @PROJECT_VERSION@
+Libs: -L${libdir} -lchitralipi
+Cflags: -I${includedir} -DCHITRALIPI_SHARED
