@@ -1,0 +1,169 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  desktop:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: linux-x64,   os: ubuntu-latest }
+          - { name: linux-arm64, os: ubuntu-24.04-arm }
+          - { name: macos-arm64, os: macos-latest }
+          - { name: windows-x64, os: windows-latest }
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DCHITRALIPI_FETCH_STB=ON
+      - name: Build
+        run: cmake --build build --config Release --parallel
+      - name: Test
+        run: ctest --test-dir build -C Release --output-on-failure
+      - name: Install
+        run: cmake --install build --config Release --prefix dist
+      - uses: actions/setup-python@v5
+        with: { python-version: '3.12' }
+      - name: Python binding test
+        shell: bash
+        run: |
+          lib=$(find dist -type f \( -name 'libchitralipi.so*' -o -name 'libchitralipi*.dylib' -o -name 'chitralipi.dll' \) | head -1)
+          echo "library: $lib"
+          CHITRALIPI_LIB="$PWD/$lib" python tests/test_python.py
+      - name: CLI smoke test
+        shell: bash
+        run: |
+          cli=dist/bin/chitralipi
+          python tests/make_png.py t.png
+          $cli encode t.png -o t.txt --max-chars 500
+          $cli info t.txt
+          $cli decode t.txt -o back.png
+          $cli pack t.png -o p.txt
+          $cli unpack p.txt -o p.png
+          cmp t.png p.png
+      - name: Package
+        shell: bash
+        run: |
+          cp LICENSE README.md SPEC.md dist/
+          mkdir -p dist/bindings && cp -r bindings/python bindings/java bindings/js dist/bindings/
+          cd dist && cmake -E tar cf ../chitralipi-${{ matrix.name }}.zip --format=zip .
+      - uses: actions/upload-artifact@v4
+        with:
+          name: chitralipi-${{ matrix.name }}
+          path: chitralipi-${{ matrix.name }}.zip
+
+  java:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with: { distribution: temurin, java-version: '17' }
+      - run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DCHITRALIPI_JNI=ON -DCHITRALIPI_BUILD_CLI=OFF -DCHITRALIPI_BUILD_TESTS=OFF
+      - run: cmake --build build --parallel
+      - name: Java test + jar
+        run: |
+          mkdir -p classes
+          javac --release 8 -d classes bindings/java/src/main/java/io/github/suvojit20070/chitralipi/Chitralipi.java
+          javac -cp classes -d classes bindings/java/src/test/java/ChitralipiTest.java
+          java -Djava.library.path=build -cp classes ChitralipiTest
+          rm classes/ChitralipiTest.class
+          jar cf chitralipi.jar -C classes .
+      - uses: actions/upload-artifact@v4
+        with:
+          name: chitralipi-java
+          path: chitralipi.jar
+
+  android:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        abi: [arm64-v8a, armeabi-v7a, x86, x86_64]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build ${{ matrix.abi }}
+        run: |
+          NDK="${ANDROID_NDK_LATEST_HOME:-$ANDROID_NDK_HOME}"
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_TOOLCHAIN_FILE="$NDK/build/cmake/android.toolchain.cmake" \
+            -DANDROID_ABI=${{ matrix.abi }} -DANDROID_PLATFORM=android-21
+          cmake --build build --parallel --target chitralipi
+          mkdir -p out/jniLibs/${{ matrix.abi }}
+          cp build/libchitralipi.so out/jniLibs/${{ matrix.abi }}/
+          "$NDK"/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-strip out/jniLibs/${{ matrix.abi }}/libchitralipi.so
+      - uses: actions/upload-artifact@v4
+        with:
+          name: android-${{ matrix.abi }}
+          path: out
+
+  android-aar:
+    needs: android
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with: { pattern: android-*, path: libs, merge-multiple: true }
+      - uses: actions/setup-java@v4
+        with: { distribution: temurin, java-version: '17' }
+      - name: Build AAR by hand (classes.jar + jni libs)
+        run: |
+          mkdir -p aar classes
+          javac --release 8 -d classes bindings/java/src/main/java/io/github/suvojit20070/chitralipi/Chitralipi.java
+          jar cf aar/classes.jar -C classes .
+          cp -r libs/jniLibs aar/jni
+          printf '<manifest xmlns:android="http://schemas.android.com/apk/res/android" package="io.github.suvojit20070.chitralipi"><uses-sdk android:minSdkVersion="21"/></manifest>\n' > aar/AndroidManifest.xml
+          touch aar/R.txt
+          (cd aar && zip -r ../chitralipi-android.aar .)
+      - uses: actions/upload-artifact@v4
+        with:
+          name: chitralipi-android
+          path: chitralipi-android.aar
+
+  wasm:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mymindstorm/setup-emsdk@v14
+      - uses: actions/setup-node@v4
+        with: { node-version: '20' }
+      - run: emcmake cmake -S . -B build-wasm -DCMAKE_BUILD_TYPE=Release
+      - run: cmake --build build-wasm --parallel
+      - name: Node test
+        run: |
+          mkdir -p js && cp bindings/js/index.mjs bindings/js/test.mjs js/
+          cp build-wasm/chitralipi.mjs build-wasm/chitralipi.wasm js/
+          node js/test.mjs
+          rm js/test.mjs
+      - uses: actions/upload-artifact@v4
+        with:
+          name: chitralipi-wasm
+          path: js
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [desktop, java, android-aar, wasm]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with: { path: artifacts }
+      - name: Collect files
+        run: |
+          mkdir -p upload
+          find artifacts -name '*.zip' -exec cp {} upload/ \;
+          cp artifacts/chitralipi-java/chitralipi.jar upload/
+          cp artifacts/chitralipi-android/chitralipi-android.aar upload/
+          (cd artifacts/chitralipi-wasm && zip -r ../../upload/chitralipi-wasm.zip .)
+          ls -l upload
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: upload/*
+          generate_release_notes: true
